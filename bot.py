@@ -2,11 +2,13 @@ from telethon import TelegramClient, events, Button
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.types import ChannelParticipantBanned, ChannelParticipantLeft
 from datetime import datetime
+import asyncio
 import storage as db
 from config import ADMIN_ID, MAIN_CH
 
 _pyro   = None
 _states = {}  # состояния диалогов
+_broadcast_active = False  # флаг активной рассылки
 
 def set_pyro(p): global _pyro; _pyro = p
 
@@ -55,6 +57,8 @@ def adm_main():
             [Button.inline("📦 Сборки",          b"ab")],
             [Button.inline("👷 Сборщики",        b"abl")],
             [Button.inline("📊 Статистика",      b"ast")],
+            [Button.inline("📣 Рассылка",        b"bc")],
+            [Button.inline("👤 Найти юзера",     b"fu")],
             [Button.inline("❌ Закрыть",         b"acl")]]
 
 def adm_groups():
@@ -138,6 +142,10 @@ def register(client: TelegramClient):
 
         if is_admin(uid):
             await event.respond("🛠 **Админка**", buttons=adm_main()); return
+
+        # проверяем бан
+        if uid in db.banned():
+            await event.respond("🚫 Ты заблокирован."); return
         if is_builder(uid):
             await event.respond("👷 **Меню сборщика**", buttons=bldr_main()); return
 
@@ -203,37 +211,40 @@ def register(client: TelegramClient):
         if not (is_admin(uid) or is_builder(uid)):
             await event.answer("⛔", alert=True); return
 
-        cbs = {
-            "amn":  lambda: event.edit("🛠 **Админка**", buttons=adm_main()),
-            "ag":   lambda: event.edit(f"🔗 Групп: {len(db.groups())}", buttons=adm_groups()),
-            "ab":   lambda: event.edit(f"📦 Сборок: {len(db.builds())}", buttons=adm_builds()),
-            "acl":  lambda: event.delete(),
-            "bmb":  lambda: event.edit("👷 **Меню сборщика**", buttons=bldr_main()),
-            "bm_lnk": lambda: event.edit("📦 Выбери сборку:", buttons=bldr_pick()) if db.builds() else event.answer("сборок нет", alert=True),
-            "bm_up":  lambda: (ss(uid, "up_desc", msg_id=event.message_id),
-                               event.edit("📝 Введи описание сборки:", buttons=[[Button.inline("❌ Отмена", b"cancel")]])),
-        }
+        await event.answer()
 
-        if d in cbs:
-            await event.answer()
-            r = cbs[d]()
-            if hasattr(r, "__await__"): await r
-            return
+        if d == "amn":
+            await event.edit("🛠 **Админка**", buttons=adm_main())
+        elif d == "ag":
+            await event.edit(f"🔗 Групп: {len(db.groups())}", buttons=adm_groups())
+        elif d == "ab":
+            await event.edit(f"📦 Сборок: {len(db.builds())}", buttons=adm_builds())
+        elif d == "acl":
+            await event.delete()
+        elif d == "bmb":
+            await event.edit("👷 **Меню сборщика**", buttons=bldr_main())
+        elif d == "bm_lnk":
+            if not db.builds(): await event.answer("сборок нет", alert=True); return
+            await event.edit("📦 Выбери сборку:", buttons=bldr_pick())
+        elif d == "bm_up":
+            ss(uid, "up_desc", msg_id=event.message_id)
+            await event.edit("📝 Введи описание сборки:", buttons=[[Button.inline("❌ Отмена", b"cancel")]])
 
         # статистика
-        if d == "ast":
+        elif d == "ast":
             if not is_admin(uid): await event.answer("⛔", alert=True); return
-            await event.answer()
-            await event.edit(stat_text(), parse_mode="markdown",
-                             buttons=[[Button.inline("🔄", b"ast"), Button.inline("◀️", b"amn")]])
+            try:
+                await event.edit(stat_text(), parse_mode="markdown",
+                                 buttons=[[Button.inline("🔄", b"ast"), Button.inline("◀️", b"amn")]])
+            except Exception as e:
+                if "not modified" in str(e).lower(): pass
+                else: raise
 
         elif d == "abl":
             if not is_admin(uid): await event.answer("⛔", alert=True); return
-            await event.answer()
             await event.edit(f"👷 Сборщиков: {len(db.builders())}", buttons=adm_bldrs())
 
         elif d == "gls":
-            await event.answer()
             bot_info = await client.get_me()
             g = db.groups()
             if not g: txt = "😕 Групп нет"
@@ -244,30 +255,25 @@ def register(client: TelegramClient):
             await event.edit(txt, parse_mode="markdown", buttons=[[Button.inline("◀️", b"ag")]])
 
         elif d == "ga":
-            await event.answer()
             ss(uid, "grp_key", msg_id=event.message_id)
             await event.edit("🔑 Ключ группы (лат/цифры/_):", buttons=[[Button.inline("❌ Отмена", b"cancel")]])
 
         elif d == "ba":
-            await event.answer()
             ss(uid, "bld_key", msg_id=event.message_id)
             await event.edit("🔑 Ключ сборки (лат/цифры/_):", buttons=[[Button.inline("❌ Отмена", b"cancel")]])
 
         elif d == "bla":
             if not is_admin(uid): await event.answer("⛔", alert=True); return
-            await event.answer()
             ss(uid, "add_bdr", msg_id=event.message_id)
             await event.edit("Введи Telegram ID нового сборщика:", buttons=[[Button.inline("❌ Отмена", b"cancel")]])
 
         elif d.startswith("gd_"):
-            await event.answer()
             key = d[3:]; label = db.groups().get(key, {}).get("label", key)
             db.del_group(key)
             await event.edit(f"🗑 `{label}` удалена", parse_mode="markdown",
                              buttons=[[Button.inline("◀️", b"ag")]])
 
         elif d.startswith("bd_"):
-            await event.answer()
             key = d[3:]; desc = db.builds().get(key, {}).get("desc", key)
             db.del_build(key)
             await event.edit(f"🗑 `{desc[:40]}` удалена", parse_mode="markdown",
@@ -280,7 +286,6 @@ def register(client: TelegramClient):
             await event.edit(f"🗑 {tid} убран", buttons=[[Button.inline("◀️", b"abl")]])
 
         elif d.startswith("bpk_"):
-            await event.answer()
             key = d[4:]
             ss(uid, "bldr_ch", build_key=key, msg_id=event.message_id)
             desc = db.builds().get(key, {}).get("desc", "")
@@ -289,7 +294,6 @@ def register(client: TelegramClient):
 
         elif d == "cancel":
             cs(uid)
-            await event.answer()
             if is_admin(uid): await event.edit("🛠 **Админка**", buttons=adm_main())
             else:             await event.edit("👷 **Меню сборщика**", buttons=bldr_main())
 
@@ -389,3 +393,196 @@ def register(client: TelegramClient):
                 buttons=[[Button.inline("◀️ Сборки", b"ab"), Button.inline("🏠", b"amn")]])
         except:
             await client.send_message(uid, f"✅ `{desc}` добавлена | {fsize(f.size)}", parse_mode="markdown")
+
+    # -- рассылка --
+    async def do_broadcast(client, from_msg, admin_uid, single_uid=None):
+        global _broadcast_active
+
+        # отправка одному юзеру
+        if single_uid:
+            try:
+                await client.forward_messages(single_uid, from_msg)
+                await client.send_message(admin_uid, f"✅ Сообщение отправлено {single_uid}")
+            except:
+                await client.send_message(admin_uid, f"❌ Не удалось отправить {single_uid}")
+            return
+
+        _broadcast_active = True
+        users = list(db.stats()["users"].keys())
+        ok = 0; fail = 0; total = len(users)
+
+        prog = await client.send_message(admin_uid, f"📣 Рассылка началась...\nВсего: {total}")
+
+        for i, uid_str in enumerate(users):
+            if int(uid_str) in db.banned(): fail += 1; continue
+            try:
+                await client.forward_messages(int(uid_str), from_msg)
+                ok += 1
+            except:
+                fail += 1
+            if (i + 1) % 20 == 0 or (i + 1) == total:
+                try:
+                    await client.edit_message(admin_uid, prog.id,
+                        f"📣 Рассылка...\n✅ {ok} / ❌ {fail} / 📊 {i+1}/{total}")
+                except: pass
+            await asyncio.sleep(0.05)  # не флудим
+
+        _broadcast_active = False
+        await client.edit_message(admin_uid, prog.id,
+            f"✅ Рассылка завершена!\n\nОтправлено: {ok}\nНе дошло: {fail}\nВсего: {total}")
+
+    @client.on(events.CallbackQuery(data=b"bc"))
+    async def cb_broadcast(event):
+        uid = event.sender_id
+        if not is_admin(uid): await event.answer("⛔", alert=True); return
+        await event.answer()
+        if _broadcast_active:
+            await event.edit("⏳ Рассылка уже идёт, подожди...",
+                             buttons=[[Button.inline("◀️ Назад", b"amn")]]); return
+        ss(uid, "bc_msg", msg_id=event.message_id)
+        await event.edit("📣 **Рассылка**\n\nОтправь сообщение которое хочешь разослать.\n"
+                         "Можно текст, фото, видео, документ — любой формат.\n\n"
+                         "Бот перешлёт его всем пользователям из базы.",
+                         parse_mode="markdown",
+                         buttons=[[Button.inline("❌ Отмена", b"cancel")]])
+
+    @client.on(events.CallbackQuery(data=b"fu"))
+    async def cb_find_user(event):
+        uid = event.sender_id
+        if not is_admin(uid): await event.answer("⛔", alert=True); return
+        await event.answer()
+        ss(uid, "find_user", msg_id=event.message_id)
+        await event.edit("👤 Введи Telegram ID пользователя:",
+                         buttons=[[Button.inline("❌ Отмена", b"cancel")]])
+
+    @client.on(events.NewMessage(pattern="/broadcast", incoming=True, func=lambda e: e.is_private))
+    async def cmd_broadcast(event):
+        if not is_admin(event.sender_id): return
+        ss(event.sender_id, "bc_msg", msg_id=None)
+        await event.respond("📣 Отправь сообщение для рассылки:")
+
+    @client.on(events.NewMessage(pattern="/users", incoming=True, func=lambda e: e.is_private))
+    async def cmd_users(event):
+        if not is_admin(event.sender_id): return
+        s = db.stats(); users = s["users"]
+        lines = []
+        for uid_str, u in list(users.items())[-20:]:  # последние 20
+            name  = u.get("name", "?") or "?"
+            uname = f"@{u['uname']}" if u.get("uname") else "нет username"
+            dls   = len(u.get("dls", []))
+            lines.append(f"`{uid_str}` {name} {uname} — {dls} скач.")
+        total = len(users)
+        await event.respond(f"👥 **Пользователей: {total}**\n\nПоследние 20:\n" + "\n".join(lines),
+                            parse_mode="markdown")
+
+    @client.on(events.NewMessage(pattern="/ban", incoming=True, func=lambda e: e.is_private))
+    async def cmd_ban(event):
+        if not is_admin(event.sender_id): return
+        parts = event.message.text.split()
+        if len(parts) < 2: await event.respond("Использование: /ban <id>"); return
+        try:   tid = int(parts[1])
+        except: await event.respond("❌ неверный id"); return
+        db.ban_user(tid)
+        await event.respond(f"🚫 {tid} забанен")
+
+    @client.on(events.NewMessage(pattern="/unban", incoming=True, func=lambda e: e.is_private))
+    async def cmd_unban(event):
+        if not is_admin(event.sender_id): return
+        parts = event.message.text.split()
+        if len(parts) < 2: await event.respond("Использование: /unban <id>"); return
+        try:   tid = int(parts[1])
+        except: await event.respond("❌ неверный id"); return
+        db.unban_user(tid)
+        await event.respond(f"✅ {tid} разбанен")
+
+    @client.on(events.NewMessage(pattern="/send", incoming=True, func=lambda e: e.is_private))
+    async def cmd_send(event):
+        # /send <id> <текст>  — отправить сообщение конкретному юзеру
+        if not is_admin(event.sender_id): return
+        parts = event.message.text.split(None, 2)
+        if len(parts) < 3: await event.respond("Использование: /send <id> <сообщение>"); return
+        try:   tid = int(parts[1])
+        except: await event.respond("❌ неверный id"); return
+        try:
+            await client.send_message(tid, f"📩 Сообщение от администратора:\n\n{parts[2]}")
+            await event.respond(f"✅ Отправлено {tid}")
+        except:
+            await event.respond(f"❌ Не удалось отправить {tid}")
+
+    @client.on(events.NewMessage(pattern="/stat", incoming=True, func=lambda e: e.is_private))
+    async def cmd_stat(event):
+        if not is_admin(event.sender_id): return
+        await event.respond(stat_text(), parse_mode="markdown")
+
+    # обработка сообщения для рассылки и поиска юзера
+    @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private and e.sender_id == ADMIN_ID))
+    async def admin_input(event):
+        uid  = event.sender_id
+        st   = gs(uid); step = st.get("step")
+        data = st.get("data", {})
+
+        if step == "bc_msg":
+            cs(uid)
+            single = data.get("single_uid")
+            if data.get("msg_id"):
+                try: await client.edit_message(uid, data["msg_id"], "📣 Запускаю...")
+                except: pass
+            asyncio.create_task(do_broadcast(client, event.message, uid, single_uid=single))
+            return
+
+        if step == "find_user":
+            await event.delete()
+            try:   tid = int(event.message.text.strip())
+            except: await client.edit_message(uid, data["msg_id"], "❌ Нужен числовой ID",
+                                               buttons=[[Button.inline("◀️", b"amn")]]); return
+            users = db.stats()["users"]; k = str(tid)
+            if k not in users:
+                await client.edit_message(uid, data["msg_id"], f"😕 Юзер {tid} не найден",
+                                          buttons=[[Button.inline("◀️", b"amn")]]); return
+            u     = users[k]
+            name  = u.get("name", "?")
+            uname = f"@{u['uname']}" if u.get("uname") else "нет"
+            dls   = len(u.get("dls", []))
+            req   = u.get("req", 0)
+            txt   = (f"👤 **Пользователь {tid}**\n\n"
+                     f"Имя: {name}\nUsername: {uname}\n"
+                     f"Первый визит: {u.get('first','?')[:10]}\n"
+                     f"Последний: {u.get('last','?')[:10]}\n"
+                     f"Запросов: {req}\nСкачиваний: {dls}")
+            if u.get("dls"):
+                dl_lines = [f"  • {d['key']} — {d['at'][:10]}" for d in u["dls"][-5:]]
+                txt += "\n\nПоследние скачивания:\n" + "\n".join(dl_lines)
+            cs(uid)
+            is_banned = tid in db.banned()
+            btns = [[Button.inline("🚫 Забанить" if not is_banned else "✅ Разбанить",
+                                   f"ban_{tid}".encode() if not is_banned else f"unban_{tid}".encode())],
+                    [Button.inline("📩 Написать", f"msg_{tid}".encode())],
+                    [Button.inline("◀️ Назад", b"amn")]]
+            await client.edit_message(uid, data["msg_id"], txt, parse_mode="markdown", buttons=btns)
+            return
+
+    # бан/разбан/написать из профиля юзера
+    @client.on(events.CallbackQuery(pattern=b"ban_"))
+    async def cb_ban(event):
+        if not is_admin(event.sender_id): return
+        tid = int(event.data.decode().split("_")[1])
+        db.ban_user(tid); await event.answer(f"🚫 {tid} забанен", alert=True)
+        await event.edit(buttons=[[Button.inline("✅ Разбанить", f"unban_{tid}".encode())],
+                                  [Button.inline("◀️ Назад", b"amn")]])
+
+    @client.on(events.CallbackQuery(pattern=b"unban_"))
+    async def cb_unban(event):
+        if not is_admin(event.sender_id): return
+        tid = int(event.data.decode().split("_")[1])
+        db.unban_user(tid); await event.answer(f"✅ {tid} разбанен", alert=True)
+        await event.edit(buttons=[[Button.inline("🚫 Забанить", f"ban_{tid}".encode())],
+                                  [Button.inline("◀️ Назад", b"amn")]])
+
+    @client.on(events.CallbackQuery(pattern=b"msg_"))
+    async def cb_msg_user(event):
+        if not is_admin(event.sender_id): return
+        await event.answer()
+        tid = int(event.data.decode().split("_")[1])
+        ss(event.sender_id, "bc_msg", msg_id=event.message_id, single_uid=tid)
+        await event.edit(f"📩 Отправь сообщение для {tid}:",
+                         buttons=[[Button.inline("❌ Отмена", b"cancel")]])

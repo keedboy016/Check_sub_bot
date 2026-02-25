@@ -61,3 +61,16 @@ def track_dl(uid, key):
     _w(d)
 
 def stats(): return load()["stats"]
+
+def banned(): return load().get("banned", [])
+
+def ban_user(uid):
+    d = load(); d.setdefault("banned", [])
+    if uid not in d["banned"]: d["banned"].append(uid)
+    _w(d)
+
+def unban_user(uid):
+    d = load(); d.setdefault("banned", [])
+    try: d["banned"].remove(uid)
+    except: pass
+    _w(d)
